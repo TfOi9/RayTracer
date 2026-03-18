@@ -171,3 +171,10 @@ impl Neg for Vec3 {
         }
     }
 }
+
+impl Vec3 {
+    pub fn unit(self) -> Self {
+        let len = self.length();
+        self / len
+    }
+}

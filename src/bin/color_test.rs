@@ -8,11 +8,11 @@ fn main() {
 
     for i in 0..width {
         for j in 0..height {
-            let col = Color::new(
+            let col: Color = Color::new(
                 (i as f64) / ((width - 1) as f64),
                 (j as f64) / ((height - 1) as f64),
                 0.0);
-            println!("{}", col);
+            col.print_color();
         }
     }
 

@@ -1,5 +1,3 @@
-use std::default;
-
 use crate::vec3::Vec3;
 use crate::vec3::Point3;
 
