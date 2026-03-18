@@ -1,0 +1,7 @@
+/target
+.DS_Store
+*.ppm
+*.in
+*.out
+*.err
+*.log
