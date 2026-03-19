@@ -6,7 +6,7 @@ use crate::vec3::Point3;
 use crate::interval::Interval;
 use crate::ray::Ray;
 
-use::rand::Rng;
+use::rand::RngCore;
 
 pub struct Camera {
     pub aspect_ratio: f64,
@@ -57,14 +57,19 @@ impl Camera {
         }
     }
 
-    fn ray_color<R: Rng>(&self, r: &Ray, world: &dyn Hittable, rng: &mut R, dep: i32) -> Color {
+    fn ray_color(&self, r: &Ray, world: &dyn Hittable, rng: &mut dyn RngCore, dep: i32) -> Color {
         if dep >= self.max_depth {
             return Color::new(0.0, 0.0, 0.0);
         }
 
         if let Some(rec) = world.hit(r, Interval::PSEUDO_POSITIVE) {
-            let direction = Vec3::random_unit_on_hemishpere(&rec.normal, rng) + rec.normal;
-            return self.ray_color(&Ray::new(rec.p, direction), world, rng, dep + 1) * 0.5;
+            if let Some((attenuation, scattered)) = rec.mat.scatter(r, &rec, rng) {
+                return attenuation.hadamard_product(self.ray_color(&scattered, world, rng, dep + 1));
+            }
+
+            Color::new(0.0, 0.0, 0.0);
+            // let direction = Vec3::random_unit_on_hemishpere(&rec.normal, rng) + rec.normal;
+            // return self.ray_color(&Ray::new(rec.p, direction), world, rng, dep + 1) * 0.5;
         }
 
         let unit_ray = r.direction().unit();
@@ -73,11 +78,11 @@ impl Camera {
         Color::new(1.0, 1.0, 1.0) * (1.0 - a) + Color::new(0.5, 0.7, 1.0) * a
     }
 
-    fn sample_square<R: Rng>(rng: &mut R) -> Vec3 {
+    fn sample_square(rng: &mut dyn RngCore) -> Vec3 {
         Vec3::new(random_real(rng) + 0.5, random_real(rng) + 0.5, 0.0)
     }
 
-    fn get_ray<R: Rng>(&self, i: i32, j: i32, rng: &mut R) -> Ray {
+    fn get_ray(&self, i: i32, j: i32, rng: &mut dyn RngCore) -> Ray {
         let offset = Self::sample_square(rng);
         let pixel_sample = self.pixel00_loc
             + self.pixel_delta_u * (i as f64 + offset.x())

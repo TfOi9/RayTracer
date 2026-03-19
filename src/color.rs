@@ -22,3 +22,9 @@ impl Color {
         println!("{} {} {}", ir, ig, ib);
     }
 }
+
+impl Color {
+    pub fn hadamard_product(&self, other: Color) -> Color {
+        Color::new(self.x() * other.x(), self.y() * other.y(), self.z() * other.z())
+    }
+}

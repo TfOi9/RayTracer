@@ -1,5 +1,6 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign, Mul, MulAssign, Div, DivAssign};
-use rand::Rng;
+use rand::RngCore;
+
 use crate::utils::{self, random_real, random_real_interval};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +80,19 @@ impl Mul<f64> for Vec3 {
                 self.e[0] * other,
                 self.e[1] * other,
                 self.e[2] * other
+            ]
+        }
+    }
+}
+
+impl Mul<Vec3> for f64 {
+    type Output = Vec3;
+    fn mul(self, other: Vec3) -> Vec3 {
+        Vec3 {
+            e: [
+                other.e[0] * self,
+                other.e[1] * self,
+                other.e[2] * self
             ]
         }
     }
@@ -184,7 +198,7 @@ impl Vec3 {
         self / len
     }
 
-    pub fn random_unit<R: Rng>(rng: &mut R) -> Self {
+    pub fn random_unit(rng: &mut dyn RngCore) -> Self {
         let theta: f64 = random_real_interval(rng, 0.0, 2.0 * utils::PI);
         let z: f64 = random_real(rng);
         let phi: f64 = z.acos();
@@ -196,7 +210,7 @@ impl Vec3 {
         )
     }
 
-    pub fn random_unit_on_hemishpere<R: Rng>(normal: &Vec3, rng: &mut R) -> Self {
+    pub fn random_unit_on_hemishpere(normal: &Vec3, rng: &mut dyn RngCore) -> Self {
         let unit = Self::random_unit(rng);
         if unit * *normal > 0.0 {
             return unit;
@@ -204,5 +218,15 @@ impl Vec3 {
         else {
             return -unit;
         }
+    }
+}
+
+impl Vec3 {
+    pub fn near_zero(&self) -> bool {
+        self.e[0].abs() < 1e-8 && self.e[1].abs() < 1e-8 && self.e[2].abs() < 1e-8
+    }
+
+    pub fn reflect(v: Vec3, n: Vec3) -> Vec3 {
+        v - 2.0 * v * n * n
     }
 }
