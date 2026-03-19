@@ -1,3 +1,4 @@
+use raytracer::Vec3;
 use raytracer::Dielectric;
 use raytracer::Point3;
 use raytracer::Sphere;
@@ -23,7 +24,11 @@ fn main() {
     world.push(Box::new(Sphere::new(Point3::new(-1.0, 0.0, -1.0), 0.4, material_bubble)));
     world.push(Box::new(Sphere::new(Point3::new(1.0, 0.0, -1.0), 0.5, material_right)));
 
-    let cam = Camera::new(16.0 / 9.0, 800, 100, 50);
+    let cam = Camera::new(16.0 / 9.0, 800,
+            100, 50, 20.0,
+            Point3::new(-2.0, 2.0, 1.0),
+            Point3::new(0.0, 0.0, -1.0),
+            Vec3::new(0.0, 1.0, 0.0));
 
     cam.render(&world);
 }
