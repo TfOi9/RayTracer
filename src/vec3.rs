@@ -1,7 +1,7 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign, Mul, MulAssign, Div, DivAssign};
 use rand::RngCore;
 
-use crate::utils::{self, random_real, random_real_interval};
+use crate::utils::{self, random_real_interval};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 {
@@ -200,7 +200,7 @@ impl Vec3 {
 
     pub fn random_unit(rng: &mut dyn RngCore) -> Self {
         let theta: f64 = random_real_interval(rng, 0.0, 2.0 * utils::PI);
-        let z: f64 = random_real(rng);
+        let z: f64 = random_real_interval(rng, -1.0, 1.0);
         let phi: f64 = z.acos();
         
         Vec3::new(

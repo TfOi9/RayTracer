@@ -67,9 +67,7 @@ impl Camera {
                 return attenuation.hadamard_product(self.ray_color(&scattered, world, rng, dep + 1));
             }
 
-            Color::new(0.0, 0.0, 0.0);
-            // let direction = Vec3::random_unit_on_hemishpere(&rec.normal, rng) + rec.normal;
-            // return self.ray_color(&Ray::new(rec.p, direction), world, rng, dep + 1) * 0.5;
+            return Color::new(0.0, 0.0, 0.0);
         }
 
         let unit_ray = r.direction().unit();

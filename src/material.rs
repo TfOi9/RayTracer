@@ -14,7 +14,8 @@ pub struct Lambertian {
 }
 
 pub struct Metal {
-    albedo: Color
+    albedo: Color,
+    fuzz: f64
 }
 
 impl Lambertian {
@@ -36,7 +37,7 @@ impl Material for Lambertian {
         let scatter_direction = rec.normal + Vec3::random_unit(rng);
 
         if scatter_direction.near_zero() {
-            return Some((self.albedo, Ray::new(rec.p, rec.p)));
+            return Some((self.albedo, Ray::new(rec.p, rec.normal)));
         }
 
         Some((self.albedo, Ray::new(rec.p, scatter_direction)))
@@ -44,22 +45,31 @@ impl Material for Lambertian {
 }
 
 impl Metal {
-    pub fn new(albedo_r: f64, albedo_g: f64, albedo_b: f64) -> Self {
+    pub fn new(albedo_r: f64, albedo_g: f64, albedo_b: f64, fuzz: f64) -> Self {
         Self {
-            albedo: Color::new(albedo_r, albedo_g, albedo_b)
+            albedo: Color::new(albedo_r, albedo_g, albedo_b),
+            fuzz: fuzz.clamp(0.0, 1.0)
         }
     }
 
-    pub fn from_color(albedo: Color) -> Self {
+    pub fn from_color(albedo: Color, fuzz: f64) -> Self {
         Self {
-            albedo
+            albedo,
+            fuzz: fuzz.clamp(0.0, 1.0)
         }
     }
 }
 
 impl Material for Metal {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, _rng: &mut dyn RngCore) -> Option<(Color, Ray)> {
-        let reflected = Vec3::reflect((*r_in.direction()).clone(), rec.normal.clone()); 
-        Some((self.albedo, Ray::new(rec.p, reflected)))
+    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut dyn RngCore) -> Option<(Color, Ray)> {
+        let reflected = Vec3::reflect((*r_in.direction()).clone(), rec.normal.clone()).unit()
+            + self.fuzz * Vec3::random_unit(rng);
+
+        let scattered = Ray::new(rec.p, reflected);
+        if *(scattered.direction()) * rec.normal <= 0.0 {
+            return None;
+        }
+
+        Some((self.albedo, scattered))
     }
 }
