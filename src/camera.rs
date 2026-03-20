@@ -30,7 +30,7 @@ pub struct Camera {
     // v: Vec3,
     // w: Vec3,
     defocus_disk_u: Vec3,
-    defocus_disk_v: Vec3
+    defocus_disk_v: Vec3,
 }
 
 impl Camera {
@@ -89,7 +89,7 @@ impl Camera {
             // v,
             // w,
             defocus_disk_u,
-            defocus_disk_v
+            defocus_disk_v,
         }
     }
 
@@ -121,7 +121,7 @@ impl Camera {
         self.center + (p.x() * self.defocus_disk_u) + (p.y() * self.defocus_disk_v)
     }
 
-    fn get_ray(&self, i: i32, j: i32, rng: &mut dyn RngCore) -> Ray {
+    fn get_ray(&self, i: i32, j: i32, tm: f64, rng: &mut dyn RngCore) -> Ray {
         let offset = Self::sample_square(rng);
         let pixel_sample = self.pixel00_loc
             + self.pixel_delta_u * (i as f64 + offset.x())
@@ -130,7 +130,7 @@ impl Camera {
         let ray_origin = if self.defocus_angle <= 0.0 { self.center } else { self.sample_defocus_disk(rng) };
         let ray_direction = pixel_sample - ray_origin;
 
-        Ray::new(ray_origin, ray_direction)
+        Ray::new(ray_origin, ray_direction, tm)
     }
 
     pub fn render(&self, world: &dyn Hittable) {
@@ -144,7 +144,7 @@ impl Camera {
                 let mut rng = rand::thread_rng();
                 let mut pixel_color = Color::new(0.0, 0.0, 0.0);
                 for _ in 0..self.samples_per_pixel {
-                    let ray = self.get_ray(i, j, &mut rng);
+                    let ray = self.get_ray(i, j, random_real(&mut rng), &mut rng);
                     pixel_color += self.ray_color(&ray, world, &mut rng, 0);
                 }
                 pixel_color *= self.pixel_sample_scale;

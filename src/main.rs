@@ -34,7 +34,8 @@ fn main() {
                     let color = Color::new(random_real(&mut rng), random_real(&mut rng), random_real(&mut rng));
                     let albedo = color.hadamard_product(color);
                     let material_sphere = Rc::new(Lambertian::from_color(albedo));
-                    world.push(Box::new(Sphere::new(center, 0.2, material_sphere)));
+                    let center1 = center + Vec3::new(0.0, random_real_interval(&mut rng, 0.0, 0.5), 0.0);
+                    world.push(Box::new(Sphere::new_moving(center, center1, 0.2, material_sphere)));
                 }
                 else if choose_mat < 0.95 {
                     let color = Color::new(
@@ -63,8 +64,8 @@ fn main() {
     let material3 = Rc::new(Metal::new(0.7, 0.6, 0.5, 0.0));
     world.push(Box::new(Sphere::new(Point3::new(4.0,1.0, 0.0), 1.0, material3)));
 
-    let cam = Camera::new(16.0 / 9.0, 1200,
-            500, 50, 20.0,
+    let cam = Camera::new(16.0 / 9.0, 400,
+            50, 50, 20.0,
             Point3::new(-13.0, 2.0, 3.0),
             Point3::new(0.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
