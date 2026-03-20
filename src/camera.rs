@@ -10,7 +10,7 @@ use crate::ray::Ray;
 use::rand::RngCore;
 
 use::rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use indicatif::{ProgressBar, ProgressStyle};
 
 pub struct Camera {
     pub aspect_ratio: f64,
@@ -53,8 +53,6 @@ impl Camera {
         let w = (lookfrom - lookat).unit();
         let u = Vec3::cross(&w, &vup).unit();
         let v = Vec3::cross(&u, &w);
-
-        eprintln!("{:?}\n{:?}\n{:?}", u, v, w);
 
         let viewport_u = viewport_width * u;
         let viewport_v = viewport_height * -v;
@@ -139,11 +137,16 @@ impl Camera {
     pub fn render(&self, world: &dyn Hittable) {
         println!("P3\n{} {}\n255", self.image_width, self.image_height);
 
-        // let total_pixels = self.image_width * self.image_height;
-        let pixels_done = AtomicUsize::new(0);
+        let total_pixels = self.image_width * self.image_height;
         let pixels: Vec<(i32, i32)> = (0..self.image_height)
             .flat_map(|j| (0..self.image_width).map(move |i| (i, j)))
             .collect();
+
+        let pb = ProgressBar::new(total_pixels as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
 
         let colors: Vec<Color> = pixels
             .par_iter()
@@ -151,15 +154,11 @@ impl Camera {
                 let mut rng = rand::thread_rng();
                 let mut pixel_color = Color::new(0.0, 0.0, 0.0);
                 for _ in 0..self.samples_per_pixel {
-                    let ray = self.get_ray(i, j, random_real(&mut rng), &mut rng);
+                    let ray = self.get_ray(i, j, 0.0, &mut rng);
                     pixel_color += self.ray_color(&ray, world, &mut rng, 0);
                 }
                 pixel_color *= self.pixel_sample_scale;
-
-                let done = pixels_done.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % (self.image_width as usize) == 0 {
-                    eprintln!("{} scanlines remaining...", self.image_height - (done / (self.image_width as usize)) as i32);
-                }
+                pb.inc(1);
 
                 pixel_color
         }).collect();
