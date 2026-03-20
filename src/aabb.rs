@@ -35,6 +35,30 @@ impl AABB {
         }
     }
 
+    pub fn from_triangle(a: Point3, b: Point3, c: Point3) -> Self {
+        let xmin = a.x().min(b.x()).min(c.x());
+        let xmax = a.x().max(b.x()).max(c.x());
+        let ymin = a.y().min(b.y()).min(c.y());
+        let ymax = a.y().max(b.y()).max(c.y());
+        let zmin = a.z().min(b.z()).min(c.z());
+        let zmax = a.z().max(b.z()).max(c.z());
+
+        let mut x = Interval::new(xmin, xmax);
+        let mut y = Interval::new(ymin, ymax);
+        let mut z = Interval::new(zmin, zmax);
+
+        let min_axis_size = 1e-8;
+        if x.size() < min_axis_size { x = x.expand(min_axis_size); }
+        if y.size() < min_axis_size { y = y.expand(min_axis_size); }
+        if z.size() < min_axis_size { z = z.expand(min_axis_size); }
+
+        Self {
+            x,
+            y,
+            z
+        }
+    }
+
     pub fn axis_interval(&self, n: i32) -> &Interval {
         if n == 1 { return &self.y; }
         else if n == 2 { return &self.z; }
@@ -44,6 +68,7 @@ impl AABB {
     pub fn hit(&self, r: &Ray, ray_t: Interval) -> bool {
         let ray_orig: &Point3 = r.origin();
         let ray_dir: &Vec3 = r.direction();
+        let mut result_interval: Interval = ray_t;
 
         for axis in 0..3 {
             let ax: &Interval = self.axis_interval(axis);
@@ -51,8 +76,6 @@ impl AABB {
 
             let t0 = (ax.min - ray_orig[axis as usize]) * adinv;
             let t1 = (ax.max - ray_orig[axis as usize]) * adinv;
-
-            let mut result_interval: Interval = ray_t;
 
             if t0 < t1 {
                 if t0 > result_interval.min { result_interval.min = t0; }
