@@ -11,6 +11,7 @@ pub mod material;
 pub mod aabb;
 pub mod bvh;
 pub mod texture;
+pub mod image_parser;
 pub mod utils;
 
 pub use vec3::Vec3;

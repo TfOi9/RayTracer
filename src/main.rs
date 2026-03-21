@@ -8,12 +8,13 @@ use raytracer::HittableList;
 use raytracer::Camera;
 use raytracer::Lambertian;
 use raytracer::Metal;
+use raytracer::texture::ImageTexture;
 use raytracer::utils::random_real;
 use raytracer::utils::random_real_interval;
 
 use std::sync::Arc;
 
-fn main() {
+fn bouncing_spheres() {
     let mut world: HittableList = HittableList::default();
 
     let checker_texture = CheckerTexture::from_colors(
@@ -80,4 +81,59 @@ fn main() {
     let world = HittableList::to_bvh(world, &mut rng);
     
     cam.render(&world);
+}
+
+fn checkered_spheres() {
+    let mut world: HittableList = HittableList::default();
+
+    let checker_texture = CheckerTexture::from_colors(
+        0.32,
+        Color::new(0.2, 0.3, 0.1),
+        Color::new(0.9, 0.9, 0.9)
+    );
+    let mat = Arc::new(Lambertian::from_texture(Arc::new(checker_texture)));
+    world.push(Box::new(Sphere::new(Point3::new(0.0, -10.0, 0.0), 10.0, mat.clone())));
+    world.push(Box::new(Sphere::new(Point3::new(0.0, 10.0, 0.0), 10.0, mat)));
+
+    let mut rng = rand::thread_rng();
+
+    let cam = Camera::new(16.0 / 9.0, 400,
+            100, 50, 20.0,
+            Point3::new(13.0, 2.0, 3.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.6, 10.0);
+    
+    let world = HittableList::to_bvh(world, &mut rng);
+    
+    cam.render(&world);
+}
+
+fn earth() {
+    let earth_texture = Arc::new(ImageTexture::new("./assets/earthmap.jpg"));
+    let earth_surface = Arc::new(Lambertian::from_texture(earth_texture));
+    let globe = Sphere::new(Point3::new(0.0, 0.0, 0.0), 2.0, earth_surface);
+    
+    let cam = Camera::new(16.0 / 9.0, 1200,
+            500, 50, 20.0,
+            Point3::new(0.0, 0.0, -12.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.0, 10.0);
+
+    let mut world = HittableList::default();
+    world.push(Box::new(globe));
+    
+    cam.render(&world);
+}
+
+fn main() {
+    let scenario = 3;
+
+    match scenario {
+        1 => bouncing_spheres(),
+        2 => checkered_spheres(),
+        3 => earth(),
+        _ => eprintln!("Invalid!")
+    }
 }

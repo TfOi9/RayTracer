@@ -6,6 +6,7 @@ use crate::ray::Ray;
 use crate::interval::Interval;
 use crate::material::Material;
 use crate::aabb::AABB;
+use crate::utils::PI;
 
 use std::sync::Arc;
 
@@ -43,6 +44,13 @@ impl Sphere {
 
     pub fn center_at(&self, tm: f64) -> Point3 {
         self.center.at(tm)
+    }
+
+    fn get_sphere_uv(p: &Point3) -> (f64, f64) {
+        let theta = (-p.y()).acos();
+        let phi = (-p.z()).atan2(p.x()) + PI;
+
+        (phi / (2.0 * PI), theta / PI)
     }
 }
 
@@ -82,6 +90,10 @@ impl Hittable for Sphere {
 
         let outward_normal = (record.p.clone() - current_center) / self.radius;
         record.set_face_normal(r, &outward_normal);
+
+        let uv = Sphere::get_sphere_uv(&outward_normal);
+        record.u = uv.0;
+        record.v = uv.1;
 
         Some(record)
     }
