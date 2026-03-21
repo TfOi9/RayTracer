@@ -131,12 +131,12 @@ fn earth() {
 fn perlin_spheres() {
     let mut world: HittableList = HittableList::default();
 
-    let pertext = Arc::new(NoiseTexture::new());
+    let pertext = Arc::new(NoiseTexture::new(4.0));
     world.push(Box::new(Sphere::new(Point3::new(0.0, -1000.0, 0.0), 1000.0, Arc::new(Lambertian::from_texture(pertext.clone())))));
     world.push(Box::new(Sphere::new(Point3::new(0.0, 2.0, 0.0), 2.0, Arc::new(Lambertian::from_texture(pertext)))));
 
-    let cam = Camera::new(16.0 / 9.0, 1200,
-            500, 50, 20.0,
+    let cam = Camera::new(16.0 / 9.0, 400,
+            100, 50, 20.0,
             Point3::new(13.0, 2.0, 3.0),
             Point3::new(0.0, 0.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
