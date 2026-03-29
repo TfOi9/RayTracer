@@ -37,4 +37,7 @@ powershell
 [_Ray Tracing: The Next Week_](https://raytracing.github.io/books/RayTracingTheNextWeek.html)
 
 本仓库作者：2025 级 ACM 班 赵睿城
-文档更新时间：2026·3·28
+
+感谢 @cicada3301digger 为本项目提供的命令行渲染入口，以及他为本项目的测试做出的贡献。
+
+文档更新时间：2026 / 3 / 29
