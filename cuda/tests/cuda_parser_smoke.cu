@@ -25,6 +25,10 @@ static bool validate_ir_indices(const ParsedIR& ir, std::string& err) {
     int leaf_count = 0;
     std::vector<int> parent_count(static_cast<size_t>(bvh_count), 0);
     for (int i = 0; i < hit_count; ++i) {
+        if (ir.hittables[i].type < 1 || ir.hittables[i].type > 4) {
+            err = "hittable type out of range at row " + std::to_string(i);
+            return false;
+        }
         if (ir.hittables[i].textureId < 0 || ir.hittables[i].textureId >= tex_count) {
             err = "hittable textureId out of range at row " + std::to_string(i);
             return false;

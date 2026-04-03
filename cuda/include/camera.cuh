@@ -38,10 +38,15 @@ static __host__ inline void write_color_ppm(FILE* output, const Color& c) {
 
 struct Camera;
 
-__global__ void init_rand_kernel(curandState *rand_states, int image_width, int image_height, unsigned long long seed);
+__global__ void init_rand_kernel(curandState *rand_states, int tile_width, int tile_height,
+                                 unsigned long long seed, int tile_origin_x, int tile_origin_y,
+                                 int full_image_width);
 
 __global__ void render_kernel(const Camera *camera, BVH *bvh, MaterialList *materials,
                               Color *framebuffer, curandState *rand_states,
+                              int tile_width, int tile_height,
+                              int tile_origin_x, int tile_origin_y,
+                              int full_image_width,
                               unsigned long long *progress_counter);
 
 struct Camera {
@@ -128,13 +133,13 @@ struct Camera {
     }
 
     __device__
-    bool hit_world_linear(const Ray& ray, HittableList *hittables, HitRecord& out_record) const {
+    bool hit_world_linear(const Ray& ray, HittableList *hittables, HitRecord& out_record, curandState* rand_state) const {
         bool any_hit = false;
         float closest = FLT_MAX;
         HitRecord temp;
 
         for (int i = 0; i < hittables->count; ++i) {
-            if (hittables->hit(i, ray, Interval(0.001f, closest), temp)) {
+            if (hittables->hit(i, ray, Interval(0.001f, closest), temp, rand_state)) {
                 any_hit = true;
                 closest = temp.t;
                 out_record = temp;
@@ -153,8 +158,8 @@ struct Camera {
         for (int bounce = depth; bounce < max_depth; ++bounce) {
             HitRecord rec;
             bool hit_any = use_bvh
-                ? bvh->hit(current_ray, Interval(0.001f, FLT_MAX), rec)
-                : hit_world_linear(current_ray, bvh->hittables, rec);
+                ? bvh->hit(current_ray, Interval(0.001f, FLT_MAX), rec, rand_state)
+                : hit_world_linear(current_ray, bvh->hittables, rec, rand_state);
 
             if (!hit_any) {
                 radiance += throughput.hadamard_product(background);
@@ -192,6 +197,10 @@ struct Camera {
 
         fprintf(output_path, "P3\n%d %d\n255\n", image_width, image_height);
 
+        constexpr int kMaxTileSize = 256;
+        constexpr float kMinFreeRatio = 0.20f;
+        constexpr int kProgressPollMs = 80;
+
         int total_pixels = image_width * image_height;
         if (total_pixels <= 0) {
             return;
@@ -204,6 +213,7 @@ struct Camera {
         cudaEvent_t render_done_event = nullptr;
         cudaStream_t render_stream = nullptr;
         cudaStream_t progress_stream = nullptr;
+        size_t tile_capacity_pixels = 0;
 
         bool failed = false;
         auto check_cuda = [&](cudaError_t err, const char* op) -> bool {
@@ -215,10 +225,74 @@ struct Camera {
             return false;
         };
 
-        check_cuda(cudaMalloc(&d_framebuffer, sizeof(Color) * total_pixels), "cudaMalloc(d_framebuffer)");
-        if (!failed) {
-            check_cuda(cudaMalloc(&d_rand_states, sizeof(curandState) * total_pixels), "cudaMalloc(d_rand_states)");
-        }
+        auto pixel_device_bytes = [&]() -> size_t {
+            return sizeof(Color) + sizeof(curandState);
+        };
+
+        auto required_free_after_alloc = [&](size_t free_mem, size_t total_mem) -> size_t {
+            const size_t target_free_total = static_cast<size_t>(static_cast<double>(total_mem) * static_cast<double>(kMinFreeRatio));
+            if (free_mem > target_free_total) {
+                return target_free_total;
+            }
+
+            // If scene/static allocations already consumed >80% VRAM, keep 20% of current free memory.
+            return static_cast<size_t>(static_cast<double>(free_mem) * static_cast<double>(kMinFreeRatio));
+        };
+
+        auto choose_tile_side_from_memory = [&](size_t free_mem, size_t required_free_bytes) -> int {
+            const size_t reserve_bytes = required_free_bytes;
+            size_t usable_bytes = 0;
+            if (free_mem > reserve_bytes) {
+                usable_bytes = free_mem - reserve_bytes;
+            }
+
+            size_t max_pixels = usable_bytes / pixel_device_bytes();
+            if (max_pixels == 0) {
+                return 1;
+            }
+
+            int side = static_cast<int>(sqrt(static_cast<double>(max_pixels)));
+            if (side < 1) {
+                side = 1;
+            }
+            if (side > kMaxTileSize) {
+                side = kMaxTileSize;
+            }
+            if (side >= 16) {
+                side = (side / 16) * 16;
+            }
+            return side > 0 ? side : 1;
+        };
+
+        auto release_tile_buffers = [&]() {
+            if (d_rand_states != nullptr) {
+                cudaFree(d_rand_states);
+                d_rand_states = nullptr;
+            }
+            if (d_framebuffer != nullptr) {
+                cudaFree(d_framebuffer);
+                d_framebuffer = nullptr;
+            }
+            tile_capacity_pixels = 0;
+        };
+
+        auto ensure_tile_capacity = [&](int tile_side) {
+            const size_t requested_pixels = static_cast<size_t>(tile_side) * static_cast<size_t>(tile_side);
+            if (requested_pixels == tile_capacity_pixels) {
+                return;
+            }
+
+            release_tile_buffers();
+
+            check_cuda(cudaMalloc(&d_framebuffer, sizeof(Color) * requested_pixels), "cudaMalloc(d_framebuffer)");
+            if (!failed) {
+                check_cuda(cudaMalloc(&d_rand_states, sizeof(curandState) * requested_pixels), "cudaMalloc(d_rand_states)");
+            }
+            if (!failed) {
+                tile_capacity_pixels = requested_pixels;
+            }
+        };
+
         if (!failed) {
             check_cuda(cudaMalloc(&d_progress_counter, sizeof(unsigned long long)), "cudaMalloc(d_progress_counter)");
         }
@@ -226,28 +300,8 @@ struct Camera {
             check_cuda(cudaMalloc(&d_camera, sizeof(Camera)), "cudaMalloc(d_camera)");
         }
         if (!failed) {
-            check_cuda(cudaMemset(d_progress_counter, 0, sizeof(unsigned long long)), "cudaMemset(d_progress_counter)");
-        }
-        if (!failed) {
             check_cuda(cudaMemcpy(d_camera, this, sizeof(Camera), cudaMemcpyHostToDevice), "cudaMemcpy(d_camera)");
         }
-
-        dim3 block_dim(16, 16);
-        dim3 grid_dim((image_width + block_dim.x - 1) / block_dim.x,
-                      (image_height + block_dim.y - 1) / block_dim.y);
-
-        unsigned long long seed = rng_seed == 0ULL
-            ? static_cast<unsigned long long>(std::chrono::high_resolution_clock::now().time_since_epoch().count())
-            : rng_seed;
-
-        if (!failed) {
-            init_rand_kernel<<<grid_dim, block_dim>>>(d_rand_states, image_width, image_height, seed);
-            check_cuda(cudaGetLastError(), "init_rand_kernel launch");
-        }
-        if (!failed) {
-            check_cuda(cudaDeviceSynchronize(), "init_rand_kernel sync");
-        }
-
         if (!failed) {
             check_cuda(cudaEventCreate(&render_done_event), "cudaEventCreate(render_done_event)");
         }
@@ -258,71 +312,304 @@ struct Camera {
             check_cuda(cudaStreamCreateWithFlags(&progress_stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags(progress_stream)");
         }
 
-        if (!failed) {
-            render_kernel<<<grid_dim, block_dim, 0, render_stream>>>(d_camera, bvh, materials, d_framebuffer,
-                           d_rand_states, d_progress_counter);
-            check_cuda(cudaGetLastError(), "render_kernel launch");
-        }
-        if (!failed) {
-            check_cuda(cudaEventRecord(render_done_event, render_stream), "cudaEventRecord(render_done_event)");
-        }
+        unsigned long long seed = rng_seed == 0ULL
+            ? static_cast<unsigned long long>(std::chrono::high_resolution_clock::now().time_since_epoch().count())
+            : rng_seed;
 
         const int bar_width = 40;
-        unsigned long long progress = 0;
-        while (!failed) {
-            cudaError_t query_status = cudaEventQuery(render_done_event);
-            if (query_status == cudaSuccess) {
-                break;
-            }
-            if (query_status != cudaErrorNotReady) {
-                check_cuda(query_status, "cudaEventQuery(render_done_event)");
-                break;
-            }
-
-            check_cuda(cudaMemcpyAsync(&progress, d_progress_counter, sizeof(unsigned long long),
-                            cudaMemcpyDeviceToHost, progress_stream), "cudaMemcpyAsync(progress)");
-            if (!failed) {
-                check_cuda(cudaStreamSynchronize(progress_stream), "cudaStreamSynchronize(progress_stream)");
-            }
-            if (failed) {
-                break;
-            }
-
-            if (progress > static_cast<unsigned long long>(total_pixels)) {
-                progress = static_cast<unsigned long long>(total_pixels);
-            }
-            float ratio = static_cast<float>(progress) / static_cast<float>(total_pixels);
-            int filled = static_cast<int>(ratio * bar_width);
-
-            fprintf(stderr, "\r[");
-            for (int k = 0; k < bar_width; ++k) {
-                fputc(k < filled ? '=' : ' ', stderr);
-            }
-            fprintf(stderr, "] %6.2f%% (%llu/%d)", ratio * 100.0f, progress, total_pixels);
-            fflush(stderr);
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        if (!failed) {
-            check_cuda(cudaEventSynchronize(render_done_event), "cudaEventSynchronize(render_done_event)");
-        }
-
-        if (!failed) {
-            progress = total_pixels;
-            fprintf(stderr, "\r[");
-            for (int k = 0; k < bar_width; ++k) {
-                fputc('=', stderr);
-            }
-            fprintf(stderr, "] 100.00%% (%d/%d)\n", total_pixels, total_pixels);
-            fflush(stderr);
-        }
+        const auto render_start_time = std::chrono::steady_clock::now();
 
         if (!failed) {
             std::vector<Color> host_framebuffer(total_pixels);
-            check_cuda(cudaMemcpy(host_framebuffer.data(), d_framebuffer, sizeof(Color) * total_pixels, cudaMemcpyDeviceToHost),
-                       "cudaMemcpy(framebuffer D2H)");
+            std::vector<Color> host_tile;
+
+            int rendered_pixels = 0;
+            dim3 block_dim(16, 16);
+            int tile_origin_y = 0;
+            bool low_mem_warning_printed = false;
+            bool vram_telemetry_unreliable = false;
+            int suspicious_mem_samples = 0;
+
+            auto query_mem_info = [&](size_t &free_mem, size_t &total_mem, const char* op) -> bool {
+                check_cuda(cudaMemGetInfo(&free_mem, &total_mem), op);
+                if (failed) {
+                    return false;
+                }
+
+                bool suspicious = (total_mem > 0 && free_mem == 0) || (free_mem > total_mem);
+                if (suspicious) {
+                    ++suspicious_mem_samples;
+                } else {
+                    suspicious_mem_samples = 0;
+                }
+
+                if (!vram_telemetry_unreliable && suspicious_mem_samples >= 2) {
+                    vram_telemetry_unreliable = true;
+                    std::cerr << "warning: cudaMemGetInfo telemetry looks unreliable;"
+                              << " switching tile sizing to fixed fallback" << std::endl;
+                }
+                return true;
+            };
+
+            while (tile_origin_y < image_height && !failed) {
+                int row_tile_step = 1;
+                int tile_origin_x = 0;
+                while (tile_origin_x < image_width && !failed) {
+                    size_t free_mem = 0;
+                    size_t total_mem = 0;
+                    if (!query_mem_info(free_mem, total_mem, "cudaMemGetInfo(pre-tile)")) {
+                        break;
+                    }
+
+                    size_t min_free_after_alloc = vram_telemetry_unreliable ? 0 : required_free_after_alloc(free_mem, total_mem);
+                    int dynamic_tile_side = vram_telemetry_unreliable
+                        ? kMaxTileSize
+                        : choose_tile_side_from_memory(free_mem, min_free_after_alloc);
+                    int remain_width = image_width - tile_origin_x;
+                    int remain_height = image_height - tile_origin_y;
+                    int tile_width = dynamic_tile_side < remain_width ? dynamic_tile_side : remain_width;
+                    int tile_height = dynamic_tile_side < remain_height ? dynamic_tile_side : remain_height;
+
+                    if (tile_width < 1) {
+                        tile_width = 1;
+                    }
+                    if (tile_height < 1) {
+                        tile_height = 1;
+                    }
+
+                    if (tile_height > row_tile_step) {
+                        row_tile_step = tile_height;
+                    }
+
+                    int committed_side = tile_width > tile_height ? tile_width : tile_height;
+                    while (!failed) {
+                        ensure_tile_capacity(committed_side);
+                        if (failed) {
+                            break;
+                        }
+
+                        size_t post_alloc_free = 0;
+                        size_t post_alloc_total = 0;
+                        if (!query_mem_info(post_alloc_free, post_alloc_total, "cudaMemGetInfo(post-alloc)")) {
+                            break;
+                        }
+
+                        if (vram_telemetry_unreliable) {
+                            break;
+                        }
+
+                        float post_alloc_free_ratio = post_alloc_total == 0
+                            ? 0.0f
+                            : static_cast<float>(post_alloc_free) / static_cast<float>(post_alloc_total);
+                        size_t post_alloc_required_free = min_free_after_alloc;
+
+                        if (post_alloc_free >= post_alloc_required_free) {
+                            break;
+                        }
+
+                        if (!low_mem_warning_printed) {
+                            std::cerr << "warning: reducing tile size to keep VRAM headroom target"
+                                      << " (required_free=" << (post_alloc_required_free / (1024.0 * 1024.0)) << " MiB"
+                                      << ", current_free_ratio=" << (post_alloc_free_ratio * 100.0f) << "%)"
+                                      << std::endl;
+                            low_mem_warning_printed = true;
+                        }
+
+                        if (committed_side <= 1) {
+                            failed = true;
+                            std::cerr << "CUDA error in tile sizing: unable to maintain VRAM headroom target" << std::endl;
+                            break;
+                        }
+
+                        committed_side /= 2;
+                        if (committed_side < 1) {
+                            committed_side = 1;
+                        }
+
+                        if (tile_width > committed_side) {
+                            tile_width = committed_side;
+                        }
+                        if (tile_height > committed_side) {
+                            tile_height = committed_side;
+                        }
+                    }
+
+                    if (failed) {
+                        break;
+                    }
+
+                    int tile_pixels = tile_width * tile_height;
+                    if (host_tile.size() < static_cast<size_t>(tile_pixels)) {
+                        host_tile.resize(static_cast<size_t>(tile_pixels));
+                    }
+
+                    size_t launch_free_mem = 0;
+                    size_t launch_total_mem = 0;
+                    if (!query_mem_info(launch_free_mem, launch_total_mem, "cudaMemGetInfo(tile-start)")) {
+                        break;
+                    }
+                    (void)launch_free_mem;
+                    (void)launch_total_mem;
+
+                    dim3 grid_dim((tile_width + block_dim.x - 1) / block_dim.x,
+                                  (tile_height + block_dim.y - 1) / block_dim.y);
+
+                    check_cuda(cudaMemsetAsync(d_progress_counter, 0, sizeof(unsigned long long), render_stream),
+                               "cudaMemsetAsync(d_progress_counter)");
+                    if (failed) {
+                        break;
+                    }
+
+                    init_rand_kernel<<<grid_dim, block_dim, 0, render_stream>>>(
+                        d_rand_states,
+                        tile_width,
+                        tile_height,
+                        seed,
+                        tile_origin_x,
+                        tile_origin_y,
+                        image_width
+                    );
+                    check_cuda(cudaGetLastError(), "init_rand_kernel launch");
+                    if (failed) {
+                        break;
+                    }
+
+                    render_kernel<<<grid_dim, block_dim, 0, render_stream>>>(
+                        d_camera,
+                        bvh,
+                        materials,
+                        d_framebuffer,
+                        d_rand_states,
+                        tile_width,
+                        tile_height,
+                        tile_origin_x,
+                        tile_origin_y,
+                        image_width,
+                        d_progress_counter
+                    );
+                    check_cuda(cudaGetLastError(), "render_kernel launch");
+                    if (failed) {
+                        break;
+                    }
+
+                    check_cuda(cudaEventRecord(render_done_event, render_stream), "cudaEventRecord(render_done_event)");
+                    if (failed) {
+                        break;
+                    }
+
+                    unsigned long long tile_progress = 0;
+                    while (!failed) {
+                        cudaError_t query_status = cudaEventQuery(render_done_event);
+                        if (query_status == cudaSuccess) {
+                            break;
+                        }
+                        if (query_status != cudaErrorNotReady) {
+                            check_cuda(query_status, "cudaEventQuery(render_done_event)");
+                            break;
+                        }
+
+                        check_cuda(cudaMemcpyAsync(&tile_progress, d_progress_counter, sizeof(unsigned long long),
+                                                   cudaMemcpyDeviceToHost, progress_stream),
+                                   "cudaMemcpyAsync(tile progress)");
+                        if (!failed) {
+                            check_cuda(cudaStreamSynchronize(progress_stream), "cudaStreamSynchronize(progress_stream)");
+                        }
+                        if (failed) {
+                            break;
+                        }
+
+                        if (tile_progress > static_cast<unsigned long long>(tile_pixels)) {
+                            tile_progress = static_cast<unsigned long long>(tile_pixels);
+                        }
+
+                        size_t monitor_free_mem = 0;
+                        size_t monitor_total_mem = 0;
+                        if (!query_mem_info(monitor_free_mem, monitor_total_mem, "cudaMemGetInfo(progress)")) {
+                            break;
+                        }
+
+                        int live_pixels = rendered_pixels + static_cast<int>(tile_progress);
+                        float ratio = static_cast<float>(live_pixels) / static_cast<float>(total_pixels);
+                        int filled = static_cast<int>(ratio * bar_width);
+                        float free_ratio = monitor_total_mem == 0
+                            ? 0.0f
+                            : static_cast<float>(monitor_free_mem) / static_cast<float>(monitor_total_mem);
+                        float used_ratio = 1.0f - free_ratio;
+                        const auto now = std::chrono::steady_clock::now();
+                        double elapsed_sec = std::chrono::duration<double>(now - render_start_time).count();
+
+                        if (vram_telemetry_unreliable) {
+                            fprintf(stderr, "\r[t=%7.2fs vram= n/a ] [", elapsed_sec);
+                        } else {
+                            fprintf(stderr, "\r[t=%7.2fs vram=%5.1f%%] [", elapsed_sec, used_ratio * 100.0f);
+                        }
+                        for (int k = 0; k < bar_width; ++k) {
+                            fputc(k < filled ? '=' : ' ', stderr);
+                        }
+                        fprintf(stderr, "] %6.2f%% (%d/%d) tile=%dx%d free=%5.1f%%",
+                                ratio * 100.0f, live_pixels, total_pixels, tile_width, tile_height, free_ratio * 100.0f);
+                        fflush(stderr);
+
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kProgressPollMs));
+                    }
+
+                    if (!failed) {
+                        check_cuda(cudaEventSynchronize(render_done_event), "cudaEventSynchronize(render_done_event)");
+                    }
+                    if (failed) {
+                        break;
+                    }
+
+                    check_cuda(cudaMemcpy(host_tile.data(), d_framebuffer, sizeof(Color) * tile_pixels, cudaMemcpyDeviceToHost),
+                               "cudaMemcpy(tile framebuffer D2H)");
+                    if (failed) {
+                        break;
+                    }
+
+                    for (int local_y = 0; local_y < tile_height; ++local_y) {
+                        int global_y = tile_origin_y + local_y;
+                        int global_row_offset = global_y * image_width;
+                        int local_row_offset = local_y * tile_width;
+                        for (int local_x = 0; local_x < tile_width; ++local_x) {
+                            int global_x = tile_origin_x + local_x;
+                            host_framebuffer[global_row_offset + global_x] = host_tile[local_row_offset + local_x];
+                        }
+                    }
+
+                    rendered_pixels += tile_pixels;
+                    float ratio = static_cast<float>(rendered_pixels) / static_cast<float>(total_pixels);
+                    int filled = static_cast<int>(ratio * bar_width);
+                    size_t final_free_mem = 0;
+                    size_t final_total_mem = 0;
+                    if (!query_mem_info(final_free_mem, final_total_mem, "cudaMemGetInfo(progress-finalize)")) {
+                        break;
+                    }
+                    float final_free_ratio = final_total_mem == 0
+                        ? 0.0f
+                        : static_cast<float>(final_free_mem) / static_cast<float>(final_total_mem);
+                    float final_used_ratio = 1.0f - final_free_ratio;
+                    const auto now = std::chrono::steady_clock::now();
+                    double elapsed_sec = std::chrono::duration<double>(now - render_start_time).count();
+
+                    if (vram_telemetry_unreliable) {
+                        fprintf(stderr, "\r[t=%7.2fs vram= n/a ] [", elapsed_sec);
+                    } else {
+                        fprintf(stderr, "\r[t=%7.2fs vram=%5.1f%%] [", elapsed_sec, final_used_ratio * 100.0f);
+                    }
+                    for (int k = 0; k < bar_width; ++k) {
+                        fputc(k < filled ? '=' : ' ', stderr);
+                    }
+                    fprintf(stderr, "] %6.2f%% (%d/%d)", ratio * 100.0f, rendered_pixels, total_pixels);
+                    fflush(stderr);
+
+                    tile_origin_x += tile_width;
+                }
+
+                tile_origin_y += row_tile_step;
+            }
+
             if (!failed) {
+                fprintf(stderr, "\n");
                 for (int j = 0; j < image_height; ++j) {
                     for (int i = 0; i < image_width; ++i) {
                         int idx = j * image_width + i;
@@ -332,20 +619,21 @@ struct Camera {
             }
         }
 
-        if (render_done_event != nullptr) {
-            cudaEventDestroy(render_done_event);
-        }
         if (progress_stream != nullptr) {
             cudaStreamDestroy(progress_stream);
         }
         if (render_stream != nullptr) {
             cudaStreamDestroy(render_stream);
         }
-        if (d_camera != nullptr) {
-            cudaFree(d_camera);
+        if (render_done_event != nullptr) {
+            cudaEventDestroy(render_done_event);
         }
         if (d_progress_counter != nullptr) {
             cudaFree(d_progress_counter);
+        }
+
+        if (d_camera != nullptr) {
+            cudaFree(d_camera);
         }
         if (d_rand_states != nullptr) {
             cudaFree(d_rand_states);
@@ -360,37 +648,51 @@ struct Camera {
     }
 };
 
-__global__ void init_rand_kernel(curandState *rand_states, int image_width, int image_height, unsigned long long seed) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= image_width || j >= image_height) {
+__global__ void init_rand_kernel(curandState *rand_states, int tile_width, int tile_height,
+                                 unsigned long long seed, int tile_origin_x, int tile_origin_y,
+                                 int full_image_width) {
+    int local_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int local_y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (local_x >= tile_width || local_y >= tile_height) {
         return;
     }
-    int idx = j * image_width + i;
-    curand_init(seed, idx, 0, &rand_states[idx]);
+
+    int local_idx = local_y * tile_width + local_x;
+    int global_x = tile_origin_x + local_x;
+    int global_y = tile_origin_y + local_y;
+    unsigned long long global_idx = static_cast<unsigned long long>(global_y) *
+                                    static_cast<unsigned long long>(full_image_width) +
+                                    static_cast<unsigned long long>(global_x);
+    curand_init(seed, global_idx, 0, &rand_states[local_idx]);
 }
 
 __global__ void render_kernel(const Camera *camera, BVH *bvh, MaterialList *materials,
                               Color *framebuffer, curandState *rand_states,
+                              int tile_width, int tile_height,
+                              int tile_origin_x, int tile_origin_y,
+                              int full_image_width,
                               unsigned long long *progress_counter) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= camera->image_width || j >= camera->image_height) {
+    int local_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int local_y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (local_x >= tile_width || local_y >= tile_height) {
         return;
     }
 
-    int idx = j * camera->image_width + i;
-    curandState local_state = rand_states[idx];
+    int local_idx = local_y * tile_width + local_x;
+    int global_x = tile_origin_x + local_x;
+    int global_y = tile_origin_y + local_y;
+    curandState local_state = rand_states[local_idx];
 
     Color pixel_color(0, 0, 0);
     for (int s = 0; s < camera->samples_per_pixel; ++s) {
-        Ray ray = camera->get_ray(i, j, &local_state);
+        Ray ray = camera->get_ray(global_x, global_y, &local_state);
         pixel_color += camera->ray_color(ray, bvh, materials, &local_state, 0);
     }
     pixel_color *= camera->pixel_sample_scale;
 
-    framebuffer[idx] = pixel_color;
-    rand_states[idx] = local_state;
+    framebuffer[local_idx] = pixel_color;
+    rand_states[local_idx] = local_state;
+    (void)full_image_width;
     atomicAdd(progress_counter, 1ULL);
 }
 

@@ -5,12 +5,14 @@
 #include "ray.cuh"
 #include "interval.cuh"
 #include "pi.cuh"
+#include "random.cuh"
 
 enum HittableType {
     UnknownHittable = 0,
     Sphere,
     Triangle,
-    Quad
+    Quad,
+    ConstantMediumSphere
 };
 
 struct HitRecord {
@@ -38,6 +40,10 @@ bool hit_triangle(const Vec3& a, const Vec3& edge1, const Vec3& edge2, const Ray
 __host__ __device__
 bool hit_quad(const Vec3& q, const Vec3& u, const Vec3& v, const Vec3& w, const Ray& ray, const Interval& ray_t, HitRecord& out_record);
 
+__device__
+bool hit_constant_medium_sphere(const Vec3& center0, const Vec3& moving, float radius, float neg_inv_density,
+                                const Ray& ray, const Interval& ray_t, curandState* rand_state, HitRecord& out_record);
+
 __host__ __device__
 inline void sphere_uv(const Vec3& p, float& u, float& v) {
     float theta = acosf(-p.y);
@@ -60,8 +66,8 @@ struct HittableList {
     int *textureId;
     HittableType *type;
 
-    __host__ __device__
-    bool hit(int index, const Ray& ray, const Interval& ray_t, HitRecord& out_record) const {
+    __device__
+    bool hit(int index, const Ray& ray, const Interval& ray_t, HitRecord& out_record, curandState* rand_state) const {
         if (count <= 0 || index < 0 || index >= count ||
             point == nullptr || u == nullptr || v == nullptr || moving == nullptr ||
             aux1 == nullptr || aux2 == nullptr || radius == nullptr || materialId == nullptr ||
@@ -84,6 +90,13 @@ struct HittableList {
             case Quad:
                 hit_ok = hit_quad(point[index], u[index], v[index], aux1[index], ray, ray_t, out_record);
                 break;
+            case ConstantMediumSphere:
+                if (radius[index] <= 0.0f || rand_state == nullptr) {
+                    return false;
+                }
+                hit_ok = hit_constant_medium_sphere(point[index], moving[index], radius[index], aux1[index].x,
+                                                    ray, ray_t, rand_state, out_record);
+                break;
             default:
                 return false;
         }
@@ -96,6 +109,9 @@ struct HittableList {
             Vec3 center_at_t = point[index] + moving[index] * ray.time;
             Vec3 outward = (out_record.p - center_at_t) / radius[index];
             sphere_uv(outward, out_record.u, out_record.v);
+        } else if (t == ConstantMediumSphere) {
+            out_record.u = 0.0f;
+            out_record.v = 0.0f;
         }
 
         return true;
@@ -185,6 +201,8 @@ bool hit_triangle(const Vec3& a, const Vec3& edge1, const Vec3& edge2, const Ray
 
 __host__ __device__
 bool hit_quad(const Vec3& q, const Vec3& u, const Vec3& v, const Vec3& w, const Ray& ray, const Interval& ray_t, HitRecord& out_record) {
+    (void)w;
+
     Vec3 n = u.cross(v);
     float denom = n.dot(ray.direction);
     if (fabsf(denom) < 1e-6f) {
@@ -199,8 +217,20 @@ bool hit_quad(const Vec3& q, const Vec3& u, const Vec3& v, const Vec3& w, const 
 
     Vec3 intersection = ray.at(t);
     Vec3 planar_hitpoint = intersection - q;
-    float alpha = w.dot(planar_hitpoint.cross(v));
-    float beta = w.dot(u.cross(planar_hitpoint));
+
+    // Solve planar_hitpoint = alpha*u + beta*v via 2x2 normal equations.
+    float uu = u.dot(u);
+    float uv = u.dot(v);
+    float vv = v.dot(v);
+    float up = planar_hitpoint.dot(u);
+    float vp = planar_hitpoint.dot(v);
+    float det = uu * vv - uv * uv;
+    if (fabsf(det) < 1e-10f) {
+        return false;
+    }
+
+    float alpha = (up * vv - vp * uv) / det;
+    float beta = (vp * uu - up * uv) / det;
     if (alpha < 0.0f || alpha > 1.0f || beta < 0.0f || beta > 1.0f) {
         return false;
     }
@@ -211,6 +241,65 @@ bool hit_quad(const Vec3& q, const Vec3& u, const Vec3& v, const Vec3& w, const 
     out_record.set_face_normal(ray, outward);
     out_record.u = alpha;
     out_record.v = beta;
+    return true;
+}
+
+__device__
+bool hit_constant_medium_sphere(const Vec3& center0, const Vec3& moving, float radius, float neg_inv_density,
+                                const Ray& ray, const Interval& ray_t, curandState* rand_state, HitRecord& out_record) {
+    Vec3 center = center0 + moving * ray.time;
+    Vec3 oc = center - ray.origin;
+    float a = ray.direction.length_squared();
+    float h = ray.direction.dot(oc);
+    float c = oc.length_squared() - radius * radius;
+    float discriminant = h * h - a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+
+    float sqrt_disc = sqrtf(discriminant);
+    float t1 = (h - sqrt_disc) / a;
+    float t2 = (h + sqrt_disc) / a;
+    if (t1 > t2) {
+        float tmp = t1;
+        t1 = t2;
+        t2 = tmp;
+    }
+
+    float rec1_t = t1;
+    float rec2_t = t2;
+    if (rec1_t < ray_t.min) {
+        rec1_t = ray_t.min;
+    }
+    if (rec2_t > ray_t.max) {
+        rec2_t = ray_t.max;
+    }
+    if (rec1_t >= rec2_t) {
+        return false;
+    }
+    if (rec1_t < 0.0f) {
+        rec1_t = 0.0f;
+    }
+
+    float ray_length = ray.direction.length();
+    float distance_inside_boundary = (rec2_t - rec1_t) * ray_length;
+
+    float xi = random_float(rand_state);
+    if (xi < 1e-6f) {
+        xi = 1e-6f;
+    }
+    float hit_distance = neg_inv_density * logf(xi);
+    if (hit_distance > distance_inside_boundary) {
+        return false;
+    }
+
+    float t = rec1_t + hit_distance / ray_length;
+    out_record.t = t;
+    out_record.p = ray.at(t);
+    out_record.normal = Vec3(1.0f, 0.0f, 0.0f);
+    out_record.front_face = true;
+    out_record.u = 0.0f;
+    out_record.v = 0.0f;
     return true;
 }
 

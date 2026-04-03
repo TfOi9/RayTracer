@@ -86,6 +86,10 @@ cargo test -q --test ir_pipeline_test
 
 - `docs/cuda_ir.md`
 
+补充说明：
+- 当前 RESOURCE 段对图片资源采用“内嵌像素”格式（不再仅保存路径）。
+- 导出包含 ImageTexture 的场景时，`.ir` 文件会显著增大，这是预期行为。
+
 ### 6. CUDA 端直接渲染（gpu_render）
 
 在 `cuda/` 目录构建并运行：

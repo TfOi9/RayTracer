@@ -120,7 +120,9 @@ struct BvhRow {
 #[derive(Clone)]
 struct ResourceRow {
     type_id: i32,
-    path: String,
+    width: u32,
+    height: u32,
+    pixels: Vec<Color>,
 }
 
 #[derive(Default)]
@@ -143,18 +145,20 @@ fn vec3_zero() -> Vec3 {
     Vec3::new(0.0, 0.0, 0.0)
 }
 
-fn bbox_from_points(points: &[Point3]) -> AABB {
-    let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for p in points {
-        min[0] = min[0].min(p[0]);
-        min[1] = min[1].min(p[1]);
-        min[2] = min[2].min(p[2]);
-        max[0] = max[0].max(p[0]);
-        max[1] = max[1].max(p[1]);
-        max[2] = max[2].max(p[2]);
+fn make_cuda_stable_bbox(mut bbox: AABB) -> AABB {
+    // CUDA side stores AABB in f32. For large world coordinates, a 1e-6 thickness
+    // can collapse to zero after f64->f32 conversion, causing BVH false misses.
+    const MIN_AXIS_SIZE: f64 = 1e-3;
+    if bbox.x.size() < MIN_AXIS_SIZE {
+        bbox.x = bbox.x.expand(MIN_AXIS_SIZE);
     }
-    AABB::from_points(min, max)
+    if bbox.y.size() < MIN_AXIS_SIZE {
+        bbox.y = bbox.y.expand(MIN_AXIS_SIZE);
+    }
+    if bbox.z.size() < MIN_AXIS_SIZE {
+        bbox.z = bbox.z.expand(MIN_AXIS_SIZE);
+    }
+    bbox
 }
 
 fn encode_texture(ctx: &mut IrContext, tex: Arc<dyn Texture>) -> Result<i32, String> {
@@ -198,9 +202,19 @@ fn encode_texture(ctx: &mut IrContext, tex: Arc<dyn Texture>) -> Result<i32, Str
             *rid
         } else {
             let rid = ctx.resources.len() as i32;
+            let width = image.width();
+            let height = image.height();
+            let mut pixels = Vec::with_capacity((width as usize) * (height as usize));
+            for j in 0..height as usize {
+                for i in 0..width as usize {
+                    pixels.push(image.pixel(i, j));
+                }
+            }
             ctx.resources.push(ResourceRow {
                 type_id: 1,
-                path: path.clone(),
+                width,
+                height,
+                pixels,
             });
             ctx.resource_map.insert(path, rid);
             rid
@@ -212,12 +226,12 @@ fn encode_texture(ctx: &mut IrContext, tex: Arc<dyn Texture>) -> Result<i32, Str
             c3: vec3_zero(),
             resource_id: rid,
         }
-    } else if any.downcast_ref::<NoiseTexture>().is_some() {
+    } else if let Some(noise) = any.downcast_ref::<NoiseTexture>() {
         TextureRow {
             type_id: 4,
             c1: vec3_zero(),
             c2: vec3_zero(),
-            c3: vec3_zero(),
+            c3: Vec3::new(noise.scale(), 0.0, 0.0),
             resource_id: 0,
         }
     } else {
@@ -325,7 +339,7 @@ fn push_triangle(ctx: &mut IrContext, tri: &Triangle, xf: Transform) -> Result<(
     let e2 = xf.apply_vec(tri.edge2());
     let b = a + e1;
     let c = a + e2;
-    let bbox = bbox_from_points(&[a, b, c]);
+    let bbox = make_cuda_stable_bbox(AABB::from_triangle(a, b, c));
     let (texture_id, material_id) = encode_material(ctx, tri.material())?;
     ctx.hittables.push(HittableRow {
         type_id: 2,
@@ -348,11 +362,7 @@ fn push_quad(ctx: &mut IrContext, quad: &Quad, xf: Transform) -> Result<(), Stri
     let u = xf.apply_vec(quad.u());
     let v = xf.apply_vec(quad.v());
     let w = xf.apply_vec(quad.w());
-    let p1 = q;
-    let p2 = q + u;
-    let p3 = q + v;
-    let p4 = p2 + v;
-    let bbox = bbox_from_points(&[p1, p2, p3, p4]);
+    let bbox = make_cuda_stable_bbox(AABB::from_quad(q, u, v));
     let (texture_id, material_id) = encode_material(ctx, quad.material())?;
     ctx.hittables.push(HittableRow {
         type_id: 3,
@@ -407,7 +417,35 @@ fn collect_hittables(ctx: &mut IrContext, obj: &dyn Hittable, xf: Transform) -> 
     }
     if let Some(medium) = any.downcast_ref::<ConstantMedium>() {
         let boundary = medium.boundary();
-        return collect_hittables(ctx, boundary.as_ref(), xf);
+        if let Some(boundary_sphere) = boundary.as_any().downcast_ref::<Sphere>() {
+            let center_ray = boundary_sphere.center_ray();
+            let center0 = xf.apply_point(*center_ray.origin());
+            let moving = xf.apply_vec(*center_ray.direction());
+            let center1 = center0 + moving;
+            let r = boundary_sphere.radius();
+            let rv = Vec3::new(r, r, r);
+            let bbox = AABB::from_aabbs(
+                &AABB::from_points(center0 - rv, center0 + rv),
+                &AABB::from_points(center1 - rv, center1 + rv),
+            );
+
+            let (texture_id, material_id) = encode_material(ctx, medium.phase_function())?;
+            ctx.hittables.push(HittableRow {
+                type_id: 4,
+                p: center0,
+                u: vec3_zero(),
+                v: vec3_zero(),
+                moving,
+                aux1: Vec3::new(medium.neg_inv_density(), 0.0, 0.0),
+                aux2: vec3_zero(),
+                radius: r,
+                texture_id,
+                material_id,
+                bbox,
+            });
+            return Ok(());
+        }
+        return Ok(());
     }
 
     Err("Unsupported Hittable type for IR export".to_string())
@@ -560,7 +598,10 @@ pub fn export_to_ir_string(root: &dyn Hittable) -> Result<String, String> {
     out.push_str("RESOURCE\n");
     out.push_str(&format!("SIZE = {}\n", ctx.resources.len()));
     for r in &ctx.resources {
-        out.push_str(&format!("{} {}\n", r.type_id, r.path));
+        out.push_str(&format!("{} {} {}\n", r.type_id, r.width, r.height));
+        for px in &r.pixels {
+            out.push_str(&format!("{}\n", format_vec3(*px)));
+        }
     }
 
     Ok(out)
@@ -609,11 +650,65 @@ pub fn parse_ir_text(text: &str) -> Result<ParsedIr, String> {
         Ok(size)
     }
 
+    fn read_resource_section(lines: &mut std::str::Lines<'_>) -> Result<usize, String> {
+        let header = lines
+            .next()
+            .ok_or_else(|| "Missing section header RESOURCE".to_string())?;
+        if header.trim() != "RESOURCE" {
+            return Err(format!("Expected section RESOURCE, got {header}"));
+        }
+
+        let size_line = lines
+            .next()
+            .ok_or_else(|| "Missing SIZE line for RESOURCE".to_string())?;
+        let (_, rhs) = size_line
+            .split_once('=')
+            .ok_or_else(|| "Invalid SIZE line for RESOURCE".to_string())?;
+        let size = rhs.trim().parse::<usize>().map_err(|e| e.to_string())?;
+
+        for _ in 0..size {
+            let row = lines
+                .next()
+                .ok_or_else(|| "Missing body line for RESOURCE".to_string())?;
+            let mut it = row.split_whitespace();
+            let type_id = it
+                .next()
+                .ok_or_else(|| "Invalid RESOURCE row: missing type".to_string())?
+                .parse::<i32>()
+                .map_err(|e| e.to_string())?;
+
+            if type_id == 1 {
+                let width = it
+                    .next()
+                    .ok_or_else(|| "Invalid RESOURCE image row: missing width".to_string())?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?;
+                let height = it
+                    .next()
+                    .ok_or_else(|| "Invalid RESOURCE image row: missing height".to_string())?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?;
+                let pixel_lines = width.checked_mul(height).ok_or_else(|| {
+                    "RESOURCE image size overflow while parsing pixel lines".to_string()
+                })?;
+                for _ in 0..pixel_lines {
+                    lines
+                        .next()
+                        .ok_or_else(|| "Missing pixel line for RESOURCE image".to_string())?;
+                }
+            } else {
+                return Err(format!("Unsupported RESOURCE type {type_id}"));
+            }
+        }
+
+        Ok(size)
+    }
+
     let texture_count = read_section(&mut lines, "TEXTURE")?;
     let material_count = read_section(&mut lines, "MATERIAL")?;
     let hittable_count = read_section(&mut lines, "HITTABLE")?;
     let bvh_count = read_section(&mut lines, "BVH")?;
-    let resource_count = read_section(&mut lines, "RESOURCE")?;
+    let resource_count = read_resource_section(&mut lines)?;
 
     Ok(ParsedIr {
         texture_count,

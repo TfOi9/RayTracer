@@ -14,8 +14,8 @@ struct BVH {
     bool *isLeaf;
     HittableList *hittables;
 
-    __host__ __device__
-    bool hit(const Ray& ray, const Interval& ray_t, HitRecord& out_record, int node_index = 0) const {
+    __device__
+    bool hit(const Ray& ray, const Interval& ray_t, HitRecord& out_record, curandState* rand_state, int node_index = 0) const {
         if (count <= 0 || node_index < 0 || node_index >= count ||
             left == nullptr || right == nullptr || bbox == nullptr ||
             hittableIndex == nullptr || hittables == nullptr) {
@@ -47,7 +47,7 @@ struct BVH {
                 if (obj_index < 0 || obj_index >= hittables->count) {
                     continue;
                 }
-                if (hittables->hit(obj_index, ray, Interval(ray_t.min, closest_t), temp_record)) {
+                if (hittables->hit(obj_index, ray, Interval(ray_t.min, closest_t), temp_record, rand_state)) {
                     any_hit = true;
                     closest_t = temp_record.t;
                     out_record = temp_record;

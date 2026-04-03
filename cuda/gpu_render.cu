@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -174,6 +175,25 @@ static void validate_ir_for_cuda(const ParsedIR& ir) {
         }
     }
 
+    for (int i = 0; i < res_count; ++i) {
+        const ParsedResourceRow& row = ir.resources[i];
+        if (row.type != 1) {
+            fail("resource[" + std::to_string(i) + "] has unsupported type " + std::to_string(row.type));
+        }
+        if (row.width < 0 || row.height < 0) {
+            fail("resource[" + std::to_string(i) + "] has negative width/height");
+        }
+        const size_t expected = static_cast<size_t>(row.width) * static_cast<size_t>(row.height);
+        if (row.pixels.size() != expected) {
+            fail("resource[" + std::to_string(i) + "] pixel count mismatch");
+        }
+        for (size_t p = 0; p < row.pixels.size(); ++p) {
+            if (!finite_vec3(row.pixels[p])) {
+                fail("resource[" + std::to_string(i) + "] contains non-finite pixel data");
+            }
+        }
+    }
+
     for (int i = 0; i < mat_count; ++i) {
         const ParsedMaterialRow& row = ir.materials[i];
         if (row.type < Lambertian || row.type > Isotropic) {
@@ -189,7 +209,7 @@ static void validate_ir_for_cuda(const ParsedIR& ir) {
 
     for (int i = 0; i < hit_count; ++i) {
         const ParsedHittableRow& row = ir.hittables[i];
-        if (row.type < Sphere || row.type > Quad) {
+        if (row.type < Sphere || row.type > ConstantMediumSphere) {
             fail("hittable[" + std::to_string(i) + "] has unknown type " + std::to_string(row.type));
         }
         if (row.materialId < 0 || row.materialId >= mat_count) {
@@ -203,8 +223,8 @@ static void validate_ir_for_cuda(const ParsedIR& ir) {
             !std::isfinite(row.radius)) {
             fail("hittable[" + std::to_string(i) + "] contains non-finite geometry");
         }
-        if (row.type == Sphere && row.radius <= 0.0f) {
-            fail("hittable[" + std::to_string(i) + "] sphere radius must be > 0");
+        if ((row.type == Sphere || row.type == ConstantMediumSphere) && row.radius <= 0.0f) {
+            fail("hittable[" + std::to_string(i) + "] sphere/medium radius must be > 0");
         }
     }
 
@@ -297,6 +317,10 @@ struct DeviceScene {
     Vec3* d_tex_color3 = nullptr;
     float* d_tex_checker_inv_scale = nullptr;
     int* d_tex_resource_id = nullptr;
+    int* d_res_width = nullptr;
+    int* d_res_height = nullptr;
+    int* d_res_offset = nullptr;
+    Vec3* d_res_pixels = nullptr;
     TextureType* d_tex_type = nullptr;
 
     int* d_mat_texture_id = nullptr;
@@ -357,6 +381,10 @@ static void free_device_scene(DeviceScene& ds) {
     cudaFree(ds.d_tex_checker_inv_scale);
     cudaFree(ds.d_tex_resource_id);
     cudaFree(ds.d_tex_type);
+    cudaFree(ds.d_res_width);
+    cudaFree(ds.d_res_height);
+    cudaFree(ds.d_res_offset);
+    cudaFree(ds.d_res_pixels);
 }
 
 static DeviceScene build_device_scene(const ParsedIR& ir) {
@@ -368,11 +396,29 @@ static DeviceScene build_device_scene(const ParsedIR& ir) {
     const int mat_count = static_cast<int>(ir.materials.size());
     const int hit_count = static_cast<int>(ir.hittables.size());
     const int bvh_count = static_cast<int>(ir.bvh.size());
+    const int res_count = static_cast<int>(ir.resources.size());
 
     std::vector<Vec3> h_tex_color1(tex_count), h_tex_color2(tex_count), h_tex_color3(tex_count);
     std::vector<float> h_tex_checker_inv_scale(tex_count, 0.0f);
     std::vector<int> h_tex_resource_id(tex_count);
     std::vector<TextureType> h_tex_type(tex_count);
+    std::vector<int> h_res_width(res_count, 0), h_res_height(res_count, 0), h_res_offset(res_count, 0);
+    size_t total_res_pixels = 0;
+    for (int i = 0; i < res_count; ++i) {
+        h_res_width[i] = ir.resources[i].width;
+        h_res_height[i] = ir.resources[i].height;
+        h_res_offset[i] = static_cast<int>(total_res_pixels);
+        total_res_pixels += ir.resources[i].pixels.size();
+    }
+    std::vector<Vec3> h_res_pixels(total_res_pixels);
+    for (int i = 0; i < res_count; ++i) {
+        const int offset = h_res_offset[i];
+        const auto& src = ir.resources[i].pixels;
+        for (size_t j = 0; j < src.size(); ++j) {
+            h_res_pixels[static_cast<size_t>(offset) + j] = src[j];
+        }
+    }
+
     for (int i = 0; i < tex_count; ++i) {
         h_tex_color1[i] = ir.textures[i].c1;
         h_tex_color2[i] = ir.textures[i].c2;
@@ -392,6 +438,14 @@ static DeviceScene build_device_scene(const ParsedIR& ir) {
     CUDA_CHECK(cudaMalloc(&ds.d_tex_checker_inv_scale, sizeof(float) * tex_count));
     CUDA_CHECK(cudaMalloc(&ds.d_tex_resource_id, sizeof(int) * tex_count));
     CUDA_CHECK(cudaMalloc(&ds.d_tex_type, sizeof(TextureType) * tex_count));
+    if (res_count > 0) {
+        CUDA_CHECK(cudaMalloc(&ds.d_res_width, sizeof(int) * res_count));
+        CUDA_CHECK(cudaMalloc(&ds.d_res_height, sizeof(int) * res_count));
+        CUDA_CHECK(cudaMalloc(&ds.d_res_offset, sizeof(int) * res_count));
+    }
+    if (total_res_pixels > 0) {
+        CUDA_CHECK(cudaMalloc(&ds.d_res_pixels, sizeof(Vec3) * total_res_pixels));
+    }
 
     CUDA_CHECK(cudaMemcpy(ds.d_tex_color1, h_tex_color1.data(), sizeof(Vec3) * tex_count, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ds.d_tex_color2, h_tex_color2.data(), sizeof(Vec3) * tex_count, cudaMemcpyHostToDevice));
@@ -399,6 +453,14 @@ static DeviceScene build_device_scene(const ParsedIR& ir) {
     CUDA_CHECK(cudaMemcpy(ds.d_tex_checker_inv_scale, h_tex_checker_inv_scale.data(), sizeof(float) * tex_count, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ds.d_tex_resource_id, h_tex_resource_id.data(), sizeof(int) * tex_count, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ds.d_tex_type, h_tex_type.data(), sizeof(TextureType) * tex_count, cudaMemcpyHostToDevice));
+    if (res_count > 0) {
+        CUDA_CHECK(cudaMemcpy(ds.d_res_width, h_res_width.data(), sizeof(int) * res_count, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ds.d_res_height, h_res_height.data(), sizeof(int) * res_count, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ds.d_res_offset, h_res_offset.data(), sizeof(int) * res_count, cudaMemcpyHostToDevice));
+    }
+    if (total_res_pixels > 0) {
+        CUDA_CHECK(cudaMemcpy(ds.d_res_pixels, h_res_pixels.data(), sizeof(Vec3) * total_res_pixels, cudaMemcpyHostToDevice));
+    }
 
     TextureList h_textures{};
     h_textures.count = tex_count;
@@ -407,6 +469,11 @@ static DeviceScene build_device_scene(const ParsedIR& ir) {
     h_textures.color3 = ds.d_tex_color3;
     h_textures.checkerInvScale = ds.d_tex_checker_inv_scale;
     h_textures.resourceId = ds.d_tex_resource_id;
+    h_textures.resourceCount = res_count;
+    h_textures.resourceWidth = ds.d_res_width;
+    h_textures.resourceHeight = ds.d_res_height;
+    h_textures.resourceOffset = ds.d_res_offset;
+    h_textures.resourcePixels = ds.d_res_pixels;
     h_textures.type = ds.d_tex_type;
 
     CUDA_CHECK(cudaMalloc(&ds.d_textures, sizeof(TextureList)));
@@ -556,9 +623,67 @@ static DeviceScene build_device_scene(const ParsedIR& ir) {
     return ds;
 }
 
+static size_t estimate_scene_device_bytes(const ParsedIR& ir) {
+    const size_t tex_count = ir.textures.size();
+    const size_t mat_count = ir.materials.size();
+    const size_t hit_count = ir.hittables.size();
+    const size_t bvh_count = ir.bvh.size();
+    const size_t res_count = ir.resources.size();
+
+    size_t bytes = 0;
+
+    bytes += sizeof(Vec3) * tex_count * 3;
+    bytes += sizeof(float) * tex_count;
+    bytes += sizeof(int) * tex_count;
+    bytes += sizeof(TextureType) * tex_count;
+    bytes += sizeof(TextureList);
+
+    bytes += sizeof(int) * mat_count;
+    bytes += sizeof(Vec3) * mat_count;
+    bytes += sizeof(float) * mat_count * 2;
+    bytes += sizeof(MaterialType) * mat_count;
+    bytes += sizeof(MaterialList);
+
+    bytes += sizeof(Vec3) * hit_count * 6;
+    bytes += sizeof(float) * hit_count;
+    bytes += sizeof(int) * hit_count * 2;
+    bytes += sizeof(HittableType) * hit_count;
+    bytes += sizeof(HittableList);
+
+    bytes += sizeof(int) * bvh_count * 3;
+    bytes += sizeof(AABB) * bvh_count;
+    bytes += sizeof(bool) * bvh_count;
+    bytes += sizeof(BVH);
+    bytes += sizeof(int) * res_count * 3; // For resource width, height, and offset
+    size_t total_res_pixels = 0;
+    for (const auto& r : ir.resources) {
+        total_res_pixels += r.pixels.size();
+    }
+    bytes += sizeof(Vec3) * total_res_pixels; // For resource pixels
+
+    return bytes;
+}
+
+static void print_device_memory_usage(const char* tag) {
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+
+    const size_t used_mem = total_mem - free_mem;
+    const double used_ratio = total_mem == 0 ? 0.0 : static_cast<double>(used_mem) / static_cast<double>(total_mem);
+    const double free_ratio = 1.0 - used_ratio;
+
+    std::cerr << std::fixed << std::setprecision(2)
+              << "[" << tag << "] VRAM used=" << (used_mem / (1024.0 * 1024.0)) << " MiB"
+              << " (" << (used_ratio * 100.0) << "%), free=" << (free_mem / (1024.0 * 1024.0)) << " MiB"
+              << " (" << (free_ratio * 100.0) << "%), total=" << (total_mem / (1024.0 * 1024.0)) << " MiB"
+              << std::endl;
+}
+
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "usage: gpu_render <ir_path> <output_ppm_path> <camera_cfg_path>" << std::endl;
+    const bool build_only = (argc == 5 && std::string(argv[4]) == "--build-only");
+    if (!(argc == 4 || build_only)) {
+        std::cerr << "usage: gpu_render <ir_path> <output_ppm_path> <camera_cfg_path> [--build-only]" << std::endl;
         return 2;
     }
 
@@ -566,8 +691,15 @@ int main(int argc, char** argv) {
     const std::string output_path = argv[2];
     const std::string camera_cfg_path = argv[3];
 
-    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 256 * 1024));
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 32 * 1024));
     CUDA_CHECK(cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64 * 1024 * 1024));
+    size_t configured_stack_size = 0;
+    size_t configured_heap_size = 0;
+    CUDA_CHECK(cudaDeviceGetLimit(&configured_stack_size, cudaLimitStackSize));
+    CUDA_CHECK(cudaDeviceGetLimit(&configured_heap_size, cudaLimitMallocHeapSize));
+    std::cerr << "CUDA limits: stack=" << configured_stack_size
+              << " bytes, malloc_heap=" << configured_heap_size << " bytes" << std::endl;
+    print_device_memory_usage("startup");
 
     std::cerr << "Loading IR from: " << ir_path << std::endl;
 
@@ -591,24 +723,38 @@ int main(int argc, char** argv) {
 
     std::cerr << "Camera config loaded successfully." << std::endl;
 
-    FILE* output = std::fopen(output_path.c_str(), "w");
-    if (!output) {
-        std::cerr << "failed to open output file: " << output_path << std::endl;
-        return 1;
-    }
-
     std::cerr << "Building device scene..." << std::endl;
+    print_device_memory_usage("before-scene-build");
 
     DeviceScene ds;
     try {
         ds = build_device_scene(ir);
     } catch (const std::exception& ex) {
-        std::fclose(output);
         std::cerr << "build_device_scene failed: " << ex.what() << std::endl;
         return 1;
     }
 
     std::cerr << "Device scene built successfully." << std::endl;
+    const size_t estimated_scene_bytes = estimate_scene_device_bytes(ir);
+    std::cerr << std::fixed << std::setprecision(2)
+              << "[scene-estimate] Device allocations ~= "
+              << (estimated_scene_bytes / (1024.0 * 1024.0)) << " MiB" << std::endl;
+    print_device_memory_usage("after-scene-build");
+
+    if (build_only) {
+        std::cerr << "Build-only mode enabled: skipping render." << std::endl;
+        free_device_scene(ds);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        print_device_memory_usage("after-scene-free");
+        return 0;
+    }
+
+    FILE* output = std::fopen(output_path.c_str(), "w");
+    if (!output) {
+        std::cerr << "failed to open output file: " << output_path << std::endl;
+        free_device_scene(ds);
+        return 1;
+    }
 
     const int image_height = std::max(1, static_cast<int>(cfg.image_width / cfg.aspect_ratio));
 
@@ -635,6 +781,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     free_device_scene(ds);
+    print_device_memory_usage("after-scene-free");
     std::fclose(output);
 
     return 0;

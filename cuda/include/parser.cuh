@@ -47,7 +47,9 @@ struct ParsedBvhRow {
 
 struct ParsedResourceRow {
     int type;
-    std::string path;
+    int width;
+    int height;
+    std::vector<Vec3> pixels;
 };
 
 struct ParsedIR {
@@ -255,9 +257,43 @@ inline bool parse_ir_file(const std::string& path, ParsedIR& out, std::string* e
             }
             return false;
         }
-        std::string rest;
-        std::getline(iss, rest);
-        row.path = trim_copy(rest);
+
+        if (row.type == 1) {
+            if (!(iss >> row.width >> row.height) || row.width < 0 || row.height < 0) {
+                if (err) {
+                    *err = "Invalid RESOURCE image header row: " + line;
+                }
+                return false;
+            }
+
+            const size_t pixel_count = static_cast<size_t>(row.width) * static_cast<size_t>(row.height);
+            row.pixels.clear();
+            row.pixels.reserve(pixel_count);
+
+            for (size_t p = 0; p < pixel_count; ++p) {
+                if (!read_non_empty_line(file, line)) {
+                    if (err) {
+                        *err = "Unexpected EOF in RESOURCE image payload";
+                    }
+                    return false;
+                }
+                std::istringstream pss(line);
+                Vec3 px{};
+                if (!(pss >> px.x >> px.y >> px.z)) {
+                    if (err) {
+                        *err = "Invalid RESOURCE image pixel row: " + line;
+                    }
+                    return false;
+                }
+                row.pixels.push_back(px);
+            }
+        } else {
+            if (err) {
+                *err = "Unsupported RESOURCE type: " + std::to_string(row.type);
+            }
+            return false;
+        }
+
         out.resources.push_back(row);
     }
 
