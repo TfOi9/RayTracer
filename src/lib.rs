@@ -18,6 +18,7 @@ pub mod constant_medium;
 pub mod utils;
 pub mod export_ir;
 pub mod export_scenarios;
+pub mod disney_bsdf;
 
 pub use vec3::Vec3;
 pub use vec3::Point3;

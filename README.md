@@ -27,7 +27,7 @@ powershell
 以下给出一个参考基线：
 渲染场景 1 （`bouncing_spheres`，参数为：宽度 1000px，比例 16:9，每像素取样数 500，最大反射深度 50），CPU 渲染约需 30s （包含场景构建），GPU 渲染约需 12s （包含 IR 解析）。
 
-上述测试的硬件环境为 Intel i9（24 核），NVIDIA GeForce RTX 5060。
+上述测试的硬件环境为 Intel Core i9（24 核），NVIDIA GeForce RTX 5060。
 
 ### 参考文献
 [_Ray Tracing in One Weekend_](https://raytracing.github.io/books/RayTracingInOneWeekend.html)
